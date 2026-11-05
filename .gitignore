@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.bak*
+DUAL_INSTALL_NINA.md
+.env
+*.jsonl
+*.db
