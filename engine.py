@@ -363,18 +363,59 @@ def _verify_key_facts(digest: str, middle, recent, prior: str = "") -> str:
         return digest
 
 
+# Digest LLM is wired from register(ctx) via ctx.llm (public PluginContext
+# surface). Directory-engine installs that skip register() keep _DIGEST_LLM
+# unset and fall through to the CPU digest — never import agent.auxiliary_client
+# (catalog rule 9).
+_DIGEST_LLM = None  # callable matching call_llm(task=, messages=, max_tokens=, timeout=)
+_DIGEST_LLM_TASK = "decay_digest"  # plugin-owned aux slot; inherit_from=compression
+
+
+def wire_digest_llm(ctx, *, task_key: str | None = _DIGEST_LLM_TASK) -> None:
+    """Bind the rolling-digest seat to ``ctx.llm`` (public). Idempotent."""
+    global _DIGEST_LLM
+    llm = getattr(ctx, "llm", None)
+    if llm is None or not hasattr(llm, "complete"):
+        return
+
+    def _call(*, task=None, messages, max_tokens=None, timeout=None, **kw):
+        # Call sites still pass task="compression" (legacy aux name). Route
+        # through the plugin-owned slot when registered; otherwise the user's
+        # active main model (omit task=).
+        call_kw: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+            "purpose": "decay.session_digest",
+        }
+        if task_key:
+            call_kw["task"] = task_key
+        return llm.complete(**call_kw)
+
+    _DIGEST_LLM = _call
+
+
+def set_digest_llm_callable(fn) -> None:
+    """Test/host seam: inject a digest callable without touching Hermes internals."""
+    global _DIGEST_LLM
+    _DIGEST_LLM = fn
+
+
 def _llm_digest_callable():
-    """Late import so the plugin loads even if aux client deps are absent."""
-    from agent.auxiliary_client import call_llm  # noqa: WPS433
-    return call_llm
+    """Return the wired digest callable, or raise so callers fall back to CPU."""
+    if _DIGEST_LLM is None:
+        raise RuntimeError(
+            "digest LLM not wired — call wire_digest_llm(ctx) from register(), "
+            "or set_digest_llm_callable() in tests"
+        )
+    return _DIGEST_LLM
 
 
 def _llm_extract(resp: Any) -> str:
-    try:
-        from agent.auxiliary_client import extract_content_or_reasoning  # noqa: WPS433
-        return (extract_content_or_reasoning(resp) or "").strip()
-    except Exception:
-        pass
+    """Normalize ctx.llm results and OpenAI-shaped responses to plain text."""
+    text = getattr(resp, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
     try:
         return (resp.choices[0].message.content or "").strip()
     except Exception:

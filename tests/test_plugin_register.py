@@ -10,14 +10,21 @@ def test_register_wires_engine_commands_and_hook():
     if str(pkg) not in sys.path:
         sys.path.insert(0, str(pkg))
 
-    recorded = {"commands": [], "hooks": [], "engines": []}
+    recorded = {"commands": [], "hooks": [], "engines": [], "aux_tasks": []}
+
+    class _Llm:
+        def complete(self, **kw):
+            raise RuntimeError("not used in this test")
 
     class Ctx:
+        llm = _Llm()
         def register_tool(self, *a, **k): pass
         def register_hook(self, name, cb): recorded["hooks"].append(name)
         def register_command(self, name, *a, **k): recorded["commands"].append(name)
         def register_context_engine(self, engine):
             recorded["engines"].append(getattr(engine, "name", None))
+        def register_auxiliary_task(self, key, **kw):
+            recorded["aux_tasks"].append((key, kw.get("inherit_from")))
         def get_config(self, key, default=None): return default
 
     import __init__ as plugin  # noqa: awkward but works with pythonpath=.
@@ -34,6 +41,10 @@ def test_register_wires_engine_commands_and_hook():
     assert recorded["engines"] == ["decay"]
     assert set(recorded["commands"]) >= {"pins", "done", "park", "unpark"}
     assert "pre_llm_call" in recorded["hooks"]
+    assert recorded["aux_tasks"] == [("decay_digest", "compression")]
+    import sys
+    eng = sys.modules.get("hermes_decay_context.engine") or sys.modules["engine"]
+    assert eng._DIGEST_LLM is not None
 
 
 def test_cmd_done_and_pins_roundtrip(tmp_path, monkeypatch):

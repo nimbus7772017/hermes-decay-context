@@ -10,8 +10,9 @@ As a general plugin, ``register(ctx)`` wires:
 * slash commands ``/pins``, ``/done``, ``/park``, ``/unpark``
 * ``pre_llm_call`` hook that injects ``format_operator_pins()`` as context
 
-No Hermes core patches. Optional open-loops DB bridge and digest helper LLM are
-OFF unless explicitly enabled via env (see README).
+No Hermes core patches (catalog rule 9). Digest LLM uses ``ctx.llm`` +
+``register_auxiliary_task(..., inherit_from="compression")``. Optional
+open-loops DB bridge is OFF unless explicitly enabled via env (see README).
 """
 from __future__ import annotations
 
@@ -142,6 +143,29 @@ def _reg_cmd(ctx, name, fn, description, args_hint=None):
 
 def register(ctx) -> None:
     """Hermes general-plugin entrypoint."""
+    # Public digest seat: plugin-owned aux task that follows auxiliary.compression
+    # until the operator pins decay_digest directly. Falls back to main-model
+    # ctx.llm.complete() when register_auxiliary_task is unavailable.
+    task_key = None
+    try:
+        ctx.register_auxiliary_task(
+            "decay_digest",
+            display_name="Decay digest",
+            description="Rolling session digest for the decay context engine",
+            inherit_from="compression",
+        )
+        task_key = "decay_digest"
+    except Exception:
+        pass
+    try:
+        from .engine import wire_digest_llm
+    except ImportError:
+        from engine import wire_digest_llm  # type: ignore
+    try:
+        wire_digest_llm(ctx, task_key=task_key)
+    except Exception:
+        pass
+
     try:
         ctx.register_context_engine(DecayEngine())
     except Exception:

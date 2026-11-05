@@ -69,21 +69,28 @@ class _FakeMM:
 
 
 def _digest_response(text="GOAL: keep testing\nSTATE: midway\nDECISIONS: none\nOPEN LOOPS: finish\nKEY FACTS: x=1"):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+    # Mirror both ctx.llm (.text) and OpenAI-shaped responses.
+    return SimpleNamespace(
+        text=text,
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+    )
 
 
 @pytest.fixture
 def mock_digest_llm(monkeypatch):
-    """Patch the auxiliary compression call the engine uses for digests."""
-    import agent.auxiliary_client as aux
+    """Inject the digest LLM callable the engine uses (public set_digest_llm_callable)."""
+    import engine as engine_mod
     calls = []
 
     def fake_call_llm(task=None, *, messages, max_tokens=None, **kw):
+        # Production call sites still pass task="compression"; wire_digest_llm
+        # remaps to the plugin-owned decay_digest aux slot.
         calls.append({"task": task, "messages": messages, "max_tokens": max_tokens})
         return _digest_response()
 
-    monkeypatch.setattr(aux, "call_llm", fake_call_llm)
-    return calls
+    monkeypatch.setattr(engine_mod, "_DIGEST_LLM", fake_call_llm)
+    yield calls
+    monkeypatch.setattr(engine_mod, "_DIGEST_LLM", None)
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +130,12 @@ class TestDigestOnEviction:
         assert "(none — this is the first digest)" not in mock_digest_llm[1]["messages"][0]["content"]
 
     def test_digest_failure_still_evicts(self, monkeypatch):
-        import agent.auxiliary_client as aux
+        import engine as engine_mod
 
         def boom(**kw):
             raise RuntimeError("aux down")
 
-        monkeypatch.setattr(aux, "call_llm", boom)
+        monkeypatch.setattr(engine_mod, "_DIGEST_LLM", boom)
         engine = _make_engine()
         provider = _FakeProvider()
         engine.configure(memory_manager=_FakeMM([provider]))
@@ -397,12 +404,12 @@ class TestDigestFallback:
     CPU digest."""
 
     def test_llm_failure_falls_through_to_cpu_digest(self, mock_digest_llm, monkeypatch):
-        import agent.auxiliary_client as aux
+        import engine as engine_mod
 
         def boom(**kw):
             raise TimeoutError("Request timed out.")
 
-        monkeypatch.setattr(aux, "call_llm", boom)  # properly restored by monkeypatch
+        monkeypatch.setattr(engine_mod, "_DIGEST_LLM", boom)
         engine = _make_engine()
         engine.configure(memory_manager=_FakeMM([_FakeProvider()]))
         out = engine.compress(_conversation(25))

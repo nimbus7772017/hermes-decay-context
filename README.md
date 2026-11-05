@@ -63,9 +63,14 @@ come from the general-plugin install.
 
 ```bash
 export HERMES_HOME=$(mktemp -d)
-hermes plugins validate /path/to/hermes-decay-context
+hermes plugins validate /path/to/hermes-decay-context --install-deps
 pytest /path/to/hermes-decay-context/tests -q
 ```
+
+Digest LLM calls go through ``ctx.llm`` and a plugin-owned ``decay_digest``
+auxiliary task (``inherit_from: compression``). Directory-engine installs that
+skip ``register()`` fall back to the deterministic CPU digest — they never
+import ``agent.auxiliary_client`` (catalog rule 9).
 
 ## Layout
 
@@ -99,5 +104,7 @@ It needs evidence to run, and it never deletes anything.
 
 ```bash
 HERMES_HOME=$(mktemp -d) PYTHONPATH=.:/path/to/hermes-agent python -m pytest -q --import-mode=importlib tests
-HERMES_AGENT=/path/to/hermes-agent python scripts/smoke_loader.py   # real PluginManager, temp HERMES_HOME
 ```
+
+Loader smoke that imported ``hermes_cli.plugins`` was removed (private core
+import under rule 9). Use ``hermes plugins validate`` for admission checks.
