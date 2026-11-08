@@ -177,7 +177,11 @@ def test_profile_override_isolates_digest_cal_and_audit(tmp_path, monkeypatch):
         path.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(process_home))
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    import engine as engine_mod
     from engine import DecayEngine
+
+    saved_ctx = engine_mod._ROUTER_CTX[:]
+    saved_loaded = engine_mod._ROUTER_CTX_LOADED_FROM[:]
 
     def _write(home, body, limit):
         token = set_hermes_home_override(home)
@@ -196,8 +200,12 @@ def test_profile_override_isolates_digest_cal_and_audit(tmp_path, monkeypatch):
         finally:
             reset_hermes_home_override(token)
 
-    path_a = _write(profile_a, "GOAL: profile a only", 90000)
-    path_b = _write(profile_b, "GOAL: profile b only", 100000)
+    try:
+        path_a = _write(profile_a, "GOAL: profile a only", 90000)
+        path_b = _write(profile_b, "GOAL: profile b only", 100000)
+    finally:
+        engine_mod._ROUTER_CTX[:] = saved_ctx
+        engine_mod._ROUTER_CTX_LOADED_FROM[:] = saved_loaded
 
     assert path_a.startswith(str(profile_a))
     assert path_b.startswith(str(profile_b))
