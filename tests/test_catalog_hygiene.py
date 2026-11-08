@@ -53,12 +53,29 @@ def test_tool_can_be_disabled(monkeypatch):
     assert tools == []
 
 
-def test_router_status_off_by_default(tmp_path, monkeypatch):
+def test_router_status_does_not_read_or_forward_model_key(tmp_path, monkeypatch):
     import engine
-    (tmp_path / "config.yaml").write_text("model:\n  base_url: http://127.0.0.1:9999/v1\n  api_key: dummy\n")
+    import urllib.request
+    sentinel = "sentinel-model-key-not-real"
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  base_url: http://127.0.0.1:9/v1\n  api_key: %s\n" % sentinel
+    )
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("HERMES_DECAY_ROUTER_STATUS", raising=False)
-    assert engine._cf_router_conf() == (None, None)
+    monkeypatch.setenv("HERMES_DECAY_ROUTER_STATUS", "1")
+    calls = []
+
+    def _refuse(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("router probe must not open a connection")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _refuse)
+    assert engine._cf_status() is None
+    assert calls == []
+    assert not hasattr(engine, "_cf_router_conf")
+    src = (PKG / "engine.py").read_text(encoding="utf-8")
+    assert "import yaml" not in src
+    assert "router/status" not in src
+    assert sentinel not in src
 
 
 def test_generic_new_message_label():
@@ -75,4 +92,4 @@ def test_register_command_without_args_hint():
         def register_command(self, name, handler, description=""): cmds.append(name)
         def register_context_engine(self, e): pass
     mod.register(Ctx())
-    assert set(cmds) == {"pins", "done", "park", "unpark"}
+    assert set(cmds) == {"pin", "pins", "done", "park", "unpark"}

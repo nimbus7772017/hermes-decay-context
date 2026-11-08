@@ -53,8 +53,7 @@ _ROUTER_CTX_FILE = "router_ctx.json"
 
 def _router_ctx_path():
     try:
-        from hermes_constants import get_hermes_home
-        return get_hermes_home() / _ROUTER_CTX_FILE
+        return _profile_home() / _ROUTER_CTX_FILE
     except Exception:
         return None
 
@@ -95,15 +94,9 @@ def _router_ctx_load() -> None:
     except Exception:
         pass
 
-# cardfollow2 2026-11-02 (the operator: "compaction follows the card she's on", root fix, not caps).
-# The X-Club-Ctx-Limit header is the LARGEST placeable card (262K), so on smaller cards (131K)
-# compaction at 0.8 x 262K could never fire before the card filled. Now, before each compaction
-# decision, ask the router (/router/status, live per-card ctx_tokens from each llama-server /props+/slots)
-# which card this session will land on:
-#   1. warm: the card holding this session's most recent slot (kv_policy prefers warm) -> that card's n_ctx
-#   2. cold: smallest healthy card that can hold the prompt (+8K reserve) -> its n_ctx ("smallest it could
-#      be served on"; tiny cards it cannot fit are excluded, e.g. a 41K card at 100K+)
-#   3. router unreachable: the card that served the last reply (X-Club-N-Ctx), else X-Club-Ctx-Limit, else config.
+# cardfollow2: context length follows a host-reported serving card (set_router_card /
+# set_router_ctx_limit) or the persisted limit file. This plugin does not call the
+# router and does not read model credentials out of config.yaml.
 # Hysteresis: no repeat compaction for a session until the prompt grows >= _CF_REGROW tokens past its
 # post-compaction size, and a card change is logged once (no flip-flop logging / thrash).
 _CF_STATUS = [None, 0.0]            # (status json, monotonic fetched)
@@ -115,47 +108,57 @@ _CF_RESERVE = 8192
 _CF_LAST_LOG = {}                   # session_id -> (card, limit) last logged
 
 
-def _os_env(k, d=None):
-    import os as _o
-    return _o.environ.get(k, d)
+def _profile_home():
+    """Active Hermes profile directory for this turn.
+
+    ``get_hermes_home()`` is context-local override, then ``HERMES_HOME``, then
+    the platform default. One process can serve several profiles; reading the
+    environment directly would write the other profile's digests into the
+    process home.
+    """
+    from hermes_constants import get_hermes_home
+    return get_hermes_home()
 
 
-def _cf_router_conf():
+def _yaml_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"1", "true", "yes", "on"}:
+            return True
+        if s in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
+def _decay_from_config_file() -> dict:
+    """Read ``context.decay`` with stock ``hermes_yaml`` (Hermes does not ship PyYAML).
+
+    Fail-open: a missing file or parser error leaves the engine on its defaults.
+    """
     try:
-        import yaml as _y
-        from hermes_constants import get_hermes_home
-        d = _y.safe_load((get_hermes_home() / "config.yaml").read_text(encoding="utf-8")) or {}
-        m = d.get("model") or {}
-        base = str(m.get("base_url") or "").rstrip("/")
-        # Optional router-aware context sizing (off by default): only when HERMES_DECAY_ROUTER_STATUS=1 and the
-        # model endpoint exposes GET /router/status with X-Club-* headers (club-router compatible). Fail-open.
-        if not base or str(_os_env("HERMES_DECAY_ROUTER_STATUS", "0")).strip().lower() not in ("1", "true", "yes", "on"):
-            return None, None
-        if base.endswith("/v1"):
-            base = base[:-3]
-        return base, str(m.get("api_key") or "")
+        from hermes_yaml import safe_load
+        data = safe_load((_profile_home() / "config.yaml").read_text(encoding="utf-8-sig")) or {}
+        if not isinstance(data, dict):
+            return {}
+        decay = (data.get("context") or {}).get("decay") or {}
+        return dict(decay) if isinstance(decay, dict) else {}
     except Exception:
-        return None, None
+        return {}
 
 
 def _cf_status():
-    import time as _t
-    if _CF_STATUS[0] is not None and _t.monotonic() - _CF_STATUS[1] < _CF_STATUS_TTL_S:
-        return _CF_STATUS[0]
-    base, key = _cf_router_conf()
-    if not base:
-        return None
-    try:
-        import json as _j, urllib.request as _u
-        req = _u.Request(base + "/router/status", headers={"Authorization": f"Bearer {key}"} if key else {})
-        with _u.urlopen(req, timeout=1.5) as r:
-            st = _j.loads(r.read().decode("utf-8"))
-        _CF_STATUS[0], _CF_STATUS[1] = st, _t.monotonic()
-        return st
-    except Exception as e:
-        logger.debug("DecayEngine cardfollow: /router/status failed: %s", e)
-        _CF_STATUS[1] = _t.monotonic() - _CF_STATUS_TTL_S + 5   # retry in ~5 s, not every call
-        return _CF_STATUS[0] if _CF_STATUS[0] is not None and _t.monotonic() - _CF_STATUS[1] < 300 else None
+    """No router credential probe.
+
+    Card sizing uses host-reported limits (``set_router_ctx_limit`` /
+    ``set_router_card``) and the persisted limit under the active profile.
+    This plugin does not read model credentials out of ``config.yaml`` and
+    does not send them anywhere.
+    """
+    return None
 
 
 def cf_predict(status, session_id, prompt_tokens):
@@ -438,7 +441,7 @@ def _probe_ctxlen(model: str, **kw) -> int | None:
             fn = getattr(mod, "get_model_context_length", None)
             if fn:
                 allowed = {k: v for k, v in kw.items()
-                           if k in ("base_url", "api_key", "provider", "config_context_length")}
+                           if k in ("base_url", "provider", "config_context_length")}
                 return int(fn(model, **allowed))
         except Exception:
             continue
@@ -515,34 +518,51 @@ class DecayEngine(ContextEngine):
         self._digest_enabled = bool(dcfg.get("digest_enabled", True))
         self._digest_max_tokens = int(dcfg.get("digest_max_tokens", 700))
         self._digest_llm = bool(dcfg.get("digest_llm", True))
-        # 2026-08-18: resolve context length with FULL reliability. The plugin
-        # loader passes no config to __init__, configure() receives only the
-        # agent: section, and run_agent's update_model() then stomps whatever
-        # we have with the auto-probe (which reads 32768/65536 for some local
-        # alias). So: read context.decay.context_length from the config FILE
-        # ourselves (profile-aware), and let _ctx_from_config shield it from
-        # update_model(). Last-ditch: probe the llama server /props n_ctx.
-        _ctx = self._ctx_from_config_file()
+        # The plugin loader passes no config to __init__, and configure() may
+        # only see the agent: section. context.decay.* is read here from the
+        # active profile's config.yaml via hermes_yaml. An explicit constructor
+        # kwarg still wins. context_length from the file shields update_model().
+        file_decay = _decay_from_config_file()
+        self._apply_file_decay(file_decay, kwargs, dcfg)
+        self._recompute()
+
+    def _apply_file_decay(self, file_decay: dict, kwargs: dict, dcfg: dict) -> None:
+        """Apply context.decay keys the constructor did not already set."""
+        if not file_decay:
+            self._ctx_from_config = False
+            return
+        for key, attr, cast in (
+            ("protect_first_n", "protect_first_n", int),
+            ("protect_last_n", "protect_last_n", int),
+            ("threshold_tokens_cap", "threshold_tokens_cap", lambda v: int(v or 0)),
+            ("digest_max_tokens", "_digest_max_tokens", int),
+        ):
+            if key in kwargs or key in dcfg or key not in file_decay:
+                continue
+            try:
+                setattr(self, attr, cast(file_decay[key]))
+            except (TypeError, ValueError):
+                pass
+        for key, attr in (("digest_enabled", "_digest_enabled"), ("digest_llm", "_digest_llm")):
+            if key in kwargs or key in dcfg or key not in file_decay:
+                continue
+            setattr(self, attr, _yaml_bool(file_decay[key], getattr(self, attr)))
+        if "threshold_percent" not in kwargs:
+            try:
+                _tp = float(file_decay.get("threshold_percent") or 0)
+                if _tp > 0:
+                    self.threshold_percent = _tp
+            except (TypeError, ValueError):
+                pass
+        try:
+            _ctx = int(file_decay.get("context_length") or 0)
+        except (TypeError, ValueError):
+            _ctx = 0
         if _ctx > 0:
             self.context_length = _ctx
             self._ctx_from_config = True
         else:
             self._ctx_from_config = False
-        # threshold_percent has the same plumbing gap — file wins when the
-        # kwargs/configure path never delivered it.
-        if "threshold_percent" not in kwargs:
-            try:
-                import os
-                import yaml
-                from hermes_constants import get_hermes_home
-                _data = yaml.safe_load(
-                    (get_hermes_home() / "config.yaml").read_text(encoding="utf-8")) or {}
-                _tp = float((((_data.get("context") or {}).get("decay") or {})).get("threshold_percent", 0) or 0)
-                if _tp > 0:
-                    self.threshold_percent = _tp
-            except Exception:
-                pass
-        self._recompute()
 
     # -- identity ----------------------------------------------------------
     @property
@@ -565,21 +585,9 @@ class DecayEngine(ContextEngine):
     # -- wiring ------------------------------------------------------------
     @staticmethod
     def _ctx_from_config_file() -> int:
-        """Read context.decay.context_length from the hermes config file.
-
-        Self-contained on purpose: the plugin loader gives __init__ no config
-        and run_agent's configure() hook only forwards the agent: section, so
-        context.decay.* never reaches us through those channels (2026-08-18:
-        this gap is why the laptop thrash-compacted at ~46k despite the knob).
-        """
+        """Read context.decay.context_length from the active profile config."""
         try:
-            import os
-            import yaml
-            from hermes_constants import get_hermes_home
-            cfg_path = get_hermes_home() / "config.yaml"
-            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-            decay = (data.get("context", {}) or {}).get("decay", {}) or {}
-            v = int(decay.get("context_length", 0) or 0)
+            v = int(_decay_from_config_file().get("context_length", 0) or 0)
             return v if v > 0 else 0
         except Exception:
             return 0
@@ -689,8 +697,7 @@ class DecayEngine(ContextEngine):
             self._recompute()
 
     def set_router_card(self, backend, n_ctx) -> None:
-        """cardfollow2 2026-11-02: X-Club-Backend / X-Club-N-Ctx of the card that served the last reply.
-        Fallback when /router/status is unreachable; a SMALLER serving card is adopted at once (safe side)."""
+        """Host-reported serving card. A smaller card is adopted at once (safe side)."""
         import time as _t
         try:
             n_ctx = int(n_ctx)
@@ -796,9 +803,7 @@ class DecayEngine(ContextEngine):
     _EST_CAL_MAX = 2.5
 
     def _est_cal_path(self):
-        from pathlib import Path as _P
-        import os as _os
-        return _P(_os.environ.get("HERMES_HOME", str(_P.home() / ".hermes"))) / "decay_est_cal.json"
+        return _profile_home() / "decay_est_cal.json"
 
     def _load_est_cal(self) -> None:
         try:
@@ -1441,11 +1446,11 @@ class DecayEngine(ContextEngine):
                     # DISTILL INVARIANT audit (SPEC_distill-invariant.md, path B): provenance on
                     # every retained digest — fact without provenance is a rumor.
                     try:
-                        import hashlib, json as _json, os as _os, time as _time
+                        import hashlib, json as _json, time as _time
                         _fid = hashlib.sha256(digest.encode()).hexdigest()[:12]
                         logger.info("[distill] fact_id=%s path=hindsight kind=session_digest turns=%d idx=%d",
                                     _fid, turn_count, self.compression_count + 1)
-                        with open(_os.path.join(_os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes"), "decay_distill_audit.jsonl"), "a") as _af:
+                        with open(_profile_home() / "decay_distill_audit.jsonl", "a", encoding="utf-8") as _af:
                             _af.write(_json.dumps({"t": int(_time.time()), "fact_id": _fid,
                                                    "path": "hindsight", "kind": "session_digest",
                                                    "evicted_turns": turn_count,
@@ -1561,8 +1566,7 @@ class DecayEngine(ContextEngine):
         """Write digest to a reviewable path (human-readable exec/cat target)."""
         try:
             import json as _json, time as _time
-            _home0 = __import__("pathlib").Path(__import__("os").environ.get(
-                "HERMES_HOME", str(__import__("pathlib").Path.home() / ".hermes")))
+            _home0 = _profile_home()
             tkey = self._thread_key()
             slug = self.digest_thread_slug(tkey)
             tdir = _home0 / "session_digests" / "threads" / slug
@@ -1590,11 +1594,8 @@ class DecayEngine(ContextEngine):
                 g_ts = gmeta.get("last_user_ts")
                 write_global = write_thread and act_ts is not None and (g_ts is None or act_ts >= float(g_ts))
 
-            import os
             from datetime import datetime
-            from pathlib import Path
-            home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-            out_dir = home / "session_digests"
+            out_dir = _home0 / "session_digests"
             out_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             idx = getattr(self, "compression_count", 0) + 1

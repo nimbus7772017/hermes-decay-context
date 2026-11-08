@@ -1,11 +1,13 @@
 name: hermes-decay-context
-version: 0.1.0
+version: 0.1.1
 description: >
   Decay context engine (clean eviction + rolling digest instead of lossy
   summarization) plus operator Pins (verbatim short directives that survive
-  compaction), wired through public plugin APIs — register_context_engine,
-  register_command (/pins /done /park /unpark), and a pre_llm_call inject hook.
-  No Hermes core overrides.
+  compaction). Capture is explicit: /pin <text> calls pin_operator_message.
+  Wired through public plugin APIs — register_context_engine,
+  register_command (/pin /pins /done /park /unpark), and a pre_llm_call inject
+  hook that does not pin user messages. No Hermes core overrides.
+  No secret_scope credentials; does not read model keys from config.yaml.
 author: Nimbus Solutions
 requires_hermes: ">=0.10.0"
 provides_tools:
