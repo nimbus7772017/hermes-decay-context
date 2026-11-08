@@ -5,10 +5,11 @@ NDVI/NDMI") fell out of the protected tail and the rolling digest never captured
 summarization is lossy exactly where it matters most. Pins never pass through a model:
 they are copied, not described, and re-injected after every compaction.
 
-Capture / inject: the hermes-decay-context plugin registers /pins /done /park /unpark
-slash commands and a pre_llm_call hook that injects format_operator_pins(). Hosts that
-already call pin_operator_message() from a gateway may keep doing so; this package does
-not patch Hermes core.
+Capture / inject: the hermes-decay-context plugin registers /pin <text> (calls
+pin_operator_message) plus /pins /done /park /unpark, and a pre_llm_call hook that
+injects format_operator_pins(). The hook does not pin user_message. Hosts that
+already call pin_operator_message() may keep doing so; this package does not patch
+Hermes core.
 
 The file is plain JSONL at get_hermes_home()/operator_directives.jsonl, capped at
 PIN_KEEP records.
@@ -783,8 +784,9 @@ def list_pins_text(now: float = None) -> str:
 # ---------------------------------------------------------------------------
 # Optional open-loops DB bridge (OFF by default). Enable with
 # HERMES_PIN_OPEN_LOOPS_BRIDGE=1 and set HERMES_PIN_DB_USER / HERMES_PIN_DB_PASSWORD
-# (optional HERMES_PIN_DB_HOST/PORT/NAME). Password via MYSQL_PWD env to the client —
-# never on argv, never logged. Failures skip quietly.
+# (optional HERMES_PIN_DB_HOST/PORT/NAME). Password via MYSQL_PWD on a minimal child
+# environment (PATH + MYSQL_PWD only) — never the Hermes process environment, never
+# on argv, never logged. Failures skip quietly.
 # ---------------------------------------------------------------------------
 _BRIDGE_ENABLED_ENV = "HERMES_PIN_OPEN_LOOPS_BRIDGE"   # must be 1/true/yes/on to enable
 
@@ -816,7 +818,7 @@ def _bridge_open_loop(rec: Dict[str, Any]) -> bool:
                _sql_str("Operator directive (pin %s): %s" % (rec.get("t", "?"), str(rec.get("text") or "")[:900])),
                ep, _sql_str(evidence[:1000]))
         )
-        env = dict(os.environ, MYSQL_PWD=pw)
+        env = {"PATH": os.environ.get("PATH", ""), "MYSQL_PWD": pw}
         r = subprocess.run(["mariadb", "--skip-ssl", "-h", host, "-P", port,
                             "-u", user, "-D", db, "-e", sql],
                            capture_output=True, text=True, timeout=10, env=env)

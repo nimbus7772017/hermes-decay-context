@@ -181,12 +181,56 @@ def test_retire_last_and_no_match():
 
 
 def test_tool_requires_evidence_and_retires(monkeypatch):
-    from tools import operator_directive_tool as t
-    pins.pin_operator_message("restart the plates window")
-    assert "evidence required" in t.operator_directive_done("plates window", "")
-    out = json.loads(t.operator_directive_done("plates window", "hermes-plates active 10:41"))
+    """Evidence gate and one-shot retire go through the handler register() publishes.
+
+    The old tools.operator_directive_tool module is not part of this plugin.
+    Calling that import would skip the registered tool; this uses the handler
+    Hermes receives for operator_directive_done.
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    pkg = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "hdc_operator_tool", pkg / "__init__.py", submodule_search_locations=[str(pkg)],
+    )
+    mod = importlib.util.module_from_spec(spec)
+    mod.__path__ = [str(pkg)]
+    sys.modules["hdc_operator_tool"] = mod
+    spec.loader.exec_module(mod)
+    registered = {}
+
+    class _Ctx:
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
+            registered[name] = handler
+
+        def register_hook(self, *args, **kwargs):
+            pass
+
+        def register_command(self, *args, **kwargs):
+            pass
+
+        def register_context_engine(self, engine):
+            pass
+
+        def register_auxiliary_task(self, *args, **kwargs):
+            pass
+
+    mod.register(_Ctx())
+    done = registered["operator_directive_done"]
+    assert pins.pin_operator_message("restart the plates window")
+    empty = json.loads(done({"substring": "plates window", "evidence": ""}))
+    assert "evidence required" in empty["error"]
+    assert any("plates window" in p["text"] for p in pins.active_pins())
+    out = json.loads(done({
+        "substring": "plates window",
+        "evidence": "hermes-plates active 10:41",
+    }))
     assert out["retired"] == 1
-    assert "error" in json.loads(t.operator_directive_done("plates window", "again"))
+    assert not any("plates window" in p["text"] for p in pins.active_pins())
+    again = json.loads(done({"substring": "plates window", "evidence": "again"}))
+    assert "error" in again
 
 
 def test_bridge_called_on_retire(monkeypatch):

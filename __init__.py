@@ -7,8 +7,9 @@ or ``hermes plugins install``) **or** place ``engine.py`` (+ ``pins/``) under
 As a general plugin, ``register(ctx)`` wires:
 
 * ``ctx.register_context_engine(DecayEngine())`` — select with ``context.engine: decay``
-* slash commands ``/pins``, ``/done``, ``/park``, ``/unpark``
+* slash commands ``/pin <text>``, ``/pins``, ``/done``, ``/park``, ``/unpark``
 * ``pre_llm_call`` hook that injects ``format_operator_pins()`` as context
+  (it does not pin ``user_message``; capture is the explicit ``/pin`` command)
 
 No Hermes core patches (catalog rule 9). Digest LLM uses ``ctx.llm`` +
 ``register_auxiliary_task(..., inherit_from="compression")``. Optional
@@ -32,6 +33,21 @@ def _op():
     except ImportError:
         from pins import operator_pins as m  # type: ignore
     return m
+
+
+def _cmd_pin(raw_args: str = "") -> str:
+    """Explicit opt-in capture. Does not pin ordinary chat turns."""
+    _m = _op(); pin_operator_message = _m.pin_operator_message; list_pins_text = _m.list_pins_text
+    arg = (raw_args or "").strip()
+    if not arg:
+        return 'Usage: "/pin <directive text>". "/pins" lists the active pins.'
+    ok = pin_operator_message(arg, source_desc="command")
+    if not ok:
+        return (
+            "Not pinned. /pin keeps a short operator directive "
+            "(not a long paste, greeting, or close request)."
+        )
+    return "Pinned.\n" + list_pins_text()
 
 
 def _cmd_pins(raw_args: str = "") -> str:
@@ -77,6 +93,9 @@ def _cmd_unpark(raw_args: str = "") -> str:
 
 def _pre_llm_inject(**kwargs: Any):
     """Inject active operator pins into the turn context (fail-open).
+
+    ``user_message`` is ignored. Pins are created only by ``/pin`` or a direct
+    ``pin_operator_message`` call, never by capturing every turn.
 
     Set HERMES_DECAY_PINS_INJECT=0 when the host gateway already appends
     format_operator_pins() (host dual-install) to avoid double injection.
@@ -171,6 +190,7 @@ def register(ctx) -> None:
     except Exception:
         pass
 
+    _reg_cmd(ctx, "pin", _cmd_pin, "Pin a short operator directive verbatim", "<directive text>")
     _reg_cmd(ctx, "pins", _cmd_pins, "List active operator-directive pins")
     _reg_cmd(ctx, "done", _cmd_done, "Retire a pin by substring or 'last'", "<words|last>")
     _reg_cmd(ctx, "park", _cmd_park, "Park (hold) a pin by substring or 'last'", "<words|last>")
